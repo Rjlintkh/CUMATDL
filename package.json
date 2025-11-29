@@ -1,0 +1,26 @@
+{
+  "name": "cumatdl",
+  "version": "1.0.0",
+  "description": "Download all course builder files when Michael Au-Yeung is enjoying his holidays.",
+  "main": "cumatdl.js",
+  "scripts": {
+    "build": "tsc",
+    "tsstart": "ts-node src/index.ts",
+    "start": "node dist/index.js"
+  },
+  "author": "source",
+  "license": "ISC",
+  "dependencies": {
+    "axios": "^1.13.2",
+    "chalk": "^4.1.2",
+    "log-update": "^7.0.2",
+    "puppeteer": "^24.31.0"
+  },
+  "devDependencies": {
+    "@types/log-update": "^3.1.0",
+    "@types/node": "^24.10.1",
+    "@types/puppeteer": "^5.4.7",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
+  }
+}
