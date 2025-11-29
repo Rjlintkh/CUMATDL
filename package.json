@@ -1,7 +1,7 @@
 {
   "name": "cumatdl",
   "version": "1.0.0",
-  "description": "Download all course builder files when Michael Au-Yeung is enjoying his holidays.",
+  "description": "Download all course builder files while Michael Au-Yeung is enjoying his holidays.",
   "main": "cumatdl.js",
   "scripts": {
     "build": "tsc",

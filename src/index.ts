@@ -13,7 +13,7 @@ const PMA_IP = '137.189.49.33';
 const PMA_NAME = 'www.math.cuhk.edu.hk';
 
 const ALLOWED_HOSTS = new Set([PMA_NAME, PMA_IP]);
-const DOWNLOAD_ROOT = path.resolve('.');
+const DOWNLOAD_ROOT = path.resolve('./dl/');
 
 const COURSE_PATTERN = /^[A-Za-z]{4}\d{4}.*$/;
 const YEAR_PATTERN = /^_?\d{4}$/;
