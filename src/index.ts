@@ -22,6 +22,11 @@ const STAFF_PREFIX = 'https://www.math.cuhk.edu.hk/~';
 
 const CURRENT_YEAR = '2526';
 
+const stringMapPath = path.resolve('stringmap.json');
+const STRING_MAP: Record<string, string> = fs.existsSync(stringMapPath)
+  ? JSON.parse(fs.readFileSync(stringMapPath, 'utf8'))
+  : {};
+
 const httpsAgent = new https.Agent({ rejectUnauthorized: false });
 
 interface YearChoice {
@@ -43,7 +48,7 @@ interface CourseProgressPayload {
   total: number;
 }
 
-interface InjectionConfig {
+interface PatchConfig {
   applyYearRewrite: boolean;
   yearExpSource: string;
   yearPrefix: string;
@@ -52,6 +57,9 @@ interface InjectionConfig {
   forceHostReplacement: boolean;
   hostNeedingFix: string;
   hostReplacement: string;
+  replaceCourseBuilderPaths: boolean;
+  blockedCoursesOnly: boolean;
+  stringMap: Record<string, string>;
   missingLogger?: (msg: string) => void;
   courseProgressCb?: (payload: CourseProgressPayload | null) => void;
 }
@@ -150,7 +158,7 @@ function parseCourseSelection(input: string, max: number): number[] {
   return Array.from(selections).sort((a, b) => a - b);
 }
 
-async function chooseCourses(courseChoices: CourseChoice[]): Promise<{ courses: CourseChoice[]; allSelected: boolean }> {
+async function chooseCourses(courseChoices: CourseChoice[]): Promise<{ courses: CourseChoice[]; allSelected: boolean; blockedOnly: boolean }> {
   console.log(chalk.bold(`\nSelect course(s):`));
   listChoices(courseChoices);
   while (true) {
@@ -161,11 +169,14 @@ async function chooseCourses(courseChoices: CourseChoice[]): Promise<{ courses: 
     const trimmed = ans.trim();
     if (trimmed === '-1') {
       console.log(chalk.greenBright('> Downloading ALL courses in this year.\n'));
-      return { courses: courseChoices, allSelected: true };
+      return { courses: courseChoices, allSelected: true, blockedOnly: false };
+    } else if (trimmed === '-2') {
+      console.log(chalk.cyanBright('> Downloading BLOCKED courses only.\n'));
+      return { courses: courseChoices, allSelected: true, blockedOnly: true };
     }
     try {
       const indices = parseCourseSelection(trimmed, courseChoices.length);
-      return { courses: indices.map(i => courseChoices[i]), allSelected: false };
+      return { courses: indices.map(i => courseChoices[i]), allSelected: false, blockedOnly: false };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       console.log(chalk.red(message));
@@ -181,7 +192,7 @@ const yearDigits = (yearName: string): string => yearName.replace(/^_/, '');
 function localPathFromUrl(url: string): string {
   const u = new URL(url);
   const parts = u.pathname.split('/').filter(Boolean);
-  if (parts[0] === 'course_builder') parts.shift();
+  if (parts[0] === 'course_builder' || parts[0] === 'courses') parts.shift();
   const decoded = parts.map(seg => decodeURIComponent(seg));
   return path.join(DOWNLOAD_ROOT, ...decoded);
 }
@@ -229,9 +240,26 @@ function renderProgress(
 
 /* ---------- per course ---------- */
 
-async function processCourse(page: Page, courseChoice: CourseChoice, config: InjectionConfig): Promise<void> {
+async function processCourse(page: Page, courseChoice: CourseChoice, config: PatchConfig): Promise<void> {
   console.log(chalk.bold(`\nNavigating to course: ${courseChoice.label}`));
   await page.goto(courseChoice.href, { waitUntil: ['domcontentloaded', 'networkidle0'] });
+  
+  const hasBeforeBlock = await page.$$eval('a', (anchors: any[]) =>
+    anchors.some(a => (a.textContent || '').trim() === 'index-before_block.html')
+  );
+  if (hasBeforeBlock) {
+    console.log(`[${chalk.cyanBright('CUMATDL')}] Unblocking course ${courseChoice.label}`);
+    const unblockUrl = new URL('index-before_block.html', courseChoice.href).toString();
+    await page.goto(unblockUrl, { waitUntil: ['domcontentloaded', 'networkidle0'] });
+    config.replaceCourseBuilderPaths = true;
+  } else {
+    config.replaceCourseBuilderPaths = false;
+    if (config.blockedCoursesOnly) {
+      console.log("Not blocked, skip.");
+      return;
+    }
+  }
+
   console.log(
     `[${chalk.cyanBright('CUMATDL')}] Year rewrite: ${config.applyYearRewrite ? 'enabled' : 'disabled'}; host fix: ${
     config.forceHostReplacement ? 'enabled' : 'disabled'
@@ -239,8 +267,8 @@ async function processCourse(page: Page, courseChoice: CourseChoice, config: Inj
   );
 
   const evaluateWithRetry = async <T>(
-    fn: (cfg: InjectionConfig) => T | Promise<T>,
-    arg: InjectionConfig,
+    fn: (config: PatchConfig) => T | Promise<T>,
+    arg: PatchConfig,
     retries = 3
   ): Promise<T> => {
     for (let attempt = 0; attempt < retries; attempt++) {
@@ -250,7 +278,7 @@ async function processCourse(page: Page, courseChoice: CourseChoice, config: Inj
         const message = err instanceof Error ? err.message : String(err);
         const destroyed = /Execution context was destroyed|Cannot find context with specified id/i.test(message);
         if (!destroyed || attempt === retries - 1) throw err;
-        console.log("[Injector] Page refreshed itself; retrying evaluation...");
+        console.log("[Patcher] Page refreshed itself; retrying evaluation...");
         await new Promise(resolve => setTimeout(resolve, 1000));
         await page.waitForFunction(() => document.readyState === 'complete', { timeout: 10_000 }).catch(() => {});
       }
@@ -259,9 +287,48 @@ async function processCourse(page: Page, courseChoice: CourseChoice, config: Inj
   };
 
   const { downloadUrls = [], serializedHtml = '' } = await evaluateWithRetry(
-    (cfg: InjectionConfig) => {
-      const yearExp = cfg.applyYearRewrite ? new RegExp(cfg.yearExpSource, 'i') : null;
+    (config: PatchConfig) => {
+      const yearExp = config.applyYearRewrite ? new RegExp(config.yearExpSource, 'i') : null;
       const urls: string[] = [];
+
+      const replacements = Object.entries(config.stringMap ?? {});
+      if (replacements.length) {
+        let replacedCount = 0;
+        const applyReplacements = (text: string | null): string => {
+          if (!text) return '';
+          let next = text;
+          for (const [bad, good] of replacements) {
+            if (next.includes(bad)) {
+              const updated = next.split(bad).join(good);
+              if (updated !== next) {
+                replacedCount += 1;
+                next = updated;
+              }
+            }
+          }
+          return next;
+        };
+
+        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+        const textNodes: Node[] = [];
+        while (walker.nextNode()) textNodes.push(walker.currentNode!);
+        textNodes.forEach(node => {
+          node.nodeValue = applyReplacements(node.nodeValue);
+        });
+
+        document.querySelectorAll('[href]').forEach(el => {
+          const value = el.getAttribute('href');
+          const next = applyReplacements(value);
+          if (next !== value) {
+            el.setAttribute('href', next);
+            console.log(`[Patcher] [REPLACE] {${value}} -> {${next}}`)
+          }
+        });
+
+        if (replacedCount > 0) {
+          console.log(`[Patcher] String map replacements applied (${replacedCount})`);
+        }
+      };
 
       const baseDir = location.pathname.endsWith('/') ? location.pathname : location.pathname.replace(/[^/]+$/, '/');
 
@@ -287,15 +354,15 @@ async function processCourse(page: Page, courseChoice: CourseChoice, config: Inj
           return null;
         }
 
-        if (cfg.forceHostReplacement && target.hostname === cfg.hostNeedingFix) {
-          target.hostname = cfg.hostReplacement;
+        if (config.forceHostReplacement && target.hostname === config.hostNeedingFix) {
+          target.hostname = config.hostReplacement;
           target.port = '';
         }
 
         if (yearExp) {
           const newPath = target.pathname.replace(
             yearExp,
-            (_match, p1: string, p2: string) => `${p1}${cfg.yearPrefix}${cfg.courseYearDigits}${p2}`
+            (_match, p1: string, p2: string) => `${p1}${config.yearPrefix}${config.courseYearDigits}${p2}`
           );
           target.pathname = newPath;
         }
@@ -306,15 +373,15 @@ async function processCourse(page: Page, courseChoice: CourseChoice, config: Inj
       document.querySelectorAll('li').forEach(li => {
         const a = li.querySelector('a');
         if (!a) return;
-        if (a.href.includes('javascript:')) {
-          console.log(`[Injector] SKIP JS Link: ${a.href}`);
-          return;
-        }
+        if (a.href.includes('javascript:')) return;
         const fixed = normalizeUrl(a.href);
         if (!fixed) return;
-        const finalHref = fixed.toString();
-        urls.push(finalHref);
-        console.log(`[Injector] URL added: ${finalHref}`);
+        let finalHref = fixed.toString();
+          if (config.replaceCourseBuilderPaths) {
+            finalHref = finalHref.replace(/course_builder/g, 'courses');
+          }
+         urls.push(finalHref);
+         console.log(`[Patcher] ADD ${finalHref}`);
       });
 
       document.querySelectorAll('a[href]').forEach(a => {
@@ -324,7 +391,7 @@ async function processCourse(page: Page, courseChoice: CourseChoice, config: Inj
         const fixed = normalizeUrl(rawHref);
         if (!fixed) return;
 
-        if (fixed.href.startsWith(cfg.staffPrefix)) return;
+        if (fixed.href.startsWith(config.staffPrefix)) return;
 
         if (fixed.origin === location.origin && fixed.pathname.startsWith('/course_builder/')) {
           const relPath = toRelative(fixed.pathname);
@@ -346,7 +413,12 @@ async function processCourse(page: Page, courseChoice: CourseChoice, config: Inj
     try {
       const u = new URL(url);
       if (!ALLOWED_HOSTS.has(u.hostname)) return false;
-      if (!u.pathname.startsWith('/course_builder/')) return false;
+
+      const pathOk =
+        u.pathname.startsWith('/course_builder/') ||
+        u.pathname.startsWith('/courses/');
+      if (!pathOk) return false;
+
       return true;
     } catch {
       return false;
@@ -407,6 +479,10 @@ async function processCourse(page: Page, courseChoice: CourseChoice, config: Inj
     args: ['--ignore-certificate-errors']
   });
   const page = await browser.newPage();
+  page.on('console', msg => {
+    const text = msg.text();
+    if (text.includes('Patcher')) console.log(text);
+  });
 
   await page.goto(PMA_CBROOT, { waitUntil: ['domcontentloaded', 'networkidle0'] });
 
@@ -488,7 +564,7 @@ async function processCourse(page: Page, courseChoice: CourseChoice, config: Inj
     return;
   }
 
-  const { courses: selectedCourses, allSelected } = await chooseCourses(courseChoices);
+  const { courses: selectedCourses, allSelected, blockedOnly } = await chooseCourses(courseChoices);
   const courseYear = yearDigits(normalizedYear);
   const missingLog: string[] | null = allSelected ? [] : null;
   const totalCourses = selectedCourses.length;
@@ -499,7 +575,7 @@ async function processCourse(page: Page, courseChoice: CourseChoice, config: Inj
   };
 
   for (const course of selectedCourses) {
-    const injectionConfig: InjectionConfig = {
+    const patchConfig: PatchConfig = {
       applyYearRewrite: !skipYearRewrite,
       yearExpSource: YEAR_FIX_REGEX_SOURCE,
       yearPrefix: hasUnderscore ? '_' : '',
@@ -508,10 +584,13 @@ async function processCourse(page: Page, courseChoice: CourseChoice, config: Inj
       forceHostReplacement,
       hostNeedingFix: PMA_IP,
       hostReplacement: PMA_NAME,
+      replaceCourseBuilderPaths: false,
+      blockedCoursesOnly: blockedOnly,
+      stringMap: STRING_MAP,
       missingLogger: missingLog ? (msg: string) => missingLog.push(msg) : undefined,
       courseProgressCb: updateProgress
     };
-    await processCourse(page, course, injectionConfig);
+    await processCourse(page, course, patchConfig);
     completedCourses += 1;
     updateProgress(null); // clear per-course line, show only overall
   }

@@ -22,6 +22,10 @@ const YEAR_PATTERN = /^_?\d{4}$/;
 const YEAR_FIX_REGEX_SOURCE = '(\\/course_builder\\/)(?:_?\\d{4})(\\/)';
 const STAFF_PREFIX = 'https://www.math.cuhk.edu.hk/~';
 const CURRENT_YEAR = '2526';
+const stringMapPath = path_1.default.resolve('stringmap.json');
+const STRING_MAP = fs_1.default.existsSync(stringMapPath)
+    ? JSON.parse(fs_1.default.readFileSync(stringMapPath, 'utf8'))
+    : {};
 const httpsAgent = new https_1.default.Agent({ rejectUnauthorized: false });
 /* ---------- persistent progress bar ---------- */
 let currentProgressLine = '';
@@ -121,11 +125,15 @@ async function chooseCourses(courseChoices) {
         const trimmed = ans.trim();
         if (trimmed === '-1') {
             console.log(chalk_1.default.greenBright('> Downloading ALL courses in this year.\n'));
-            return { courses: courseChoices, allSelected: true };
+            return { courses: courseChoices, allSelected: true, blockedOnly: false };
+        }
+        else if (trimmed === '-2') {
+            console.log(chalk_1.default.cyanBright('> Downloading BLOCKED courses only.\n'));
+            return { courses: courseChoices, allSelected: true, blockedOnly: true };
         }
         try {
             const indices = parseCourseSelection(trimmed, courseChoices.length);
-            return { courses: indices.map(i => courseChoices[i]), allSelected: false };
+            return { courses: indices.map(i => courseChoices[i]), allSelected: false, blockedOnly: false };
         }
         catch (err) {
             const message = err instanceof Error ? err.message : String(err);
@@ -139,7 +147,7 @@ const yearDigits = (yearName) => yearName.replace(/^_/, '');
 function localPathFromUrl(url) {
     const u = new URL(url);
     const parts = u.pathname.split('/').filter(Boolean);
-    if (parts[0] === 'course_builder')
+    if (parts[0] === 'course_builder' || parts[0] === 'courses')
         parts.shift();
     const decoded = parts.map(seg => decodeURIComponent(seg));
     return path_1.default.join(DOWNLOAD_ROOT, ...decoded);
@@ -179,6 +187,20 @@ function renderProgress(completed, total, courseProgress) {
 async function processCourse(page, courseChoice, config) {
     console.log(chalk_1.default.bold(`\nNavigating to course: ${courseChoice.label}`));
     await page.goto(courseChoice.href, { waitUntil: ['domcontentloaded', 'networkidle0'] });
+    const hasBeforeBlock = await page.$$eval('a', (anchors) => anchors.some(a => (a.textContent || '').trim() === 'index-before_block.html'));
+    if (hasBeforeBlock) {
+        console.log(`[${chalk_1.default.cyanBright('CUMATDL')}] Unblocking course ${courseChoice.label}`);
+        const unblockUrl = new URL('index-before_block.html', courseChoice.href).toString();
+        await page.goto(unblockUrl, { waitUntil: ['domcontentloaded', 'networkidle0'] });
+        config.replaceCourseBuilderPaths = true;
+    }
+    else {
+        config.replaceCourseBuilderPaths = false;
+        if (config.blockedCoursesOnly) {
+            console.log("Not blocked, skip.");
+            return;
+        }
+    }
     console.log(`[${chalk_1.default.cyanBright('CUMATDL')}] Year rewrite: ${config.applyYearRewrite ? 'enabled' : 'disabled'}; host fix: ${config.forceHostReplacement ? 'enabled' : 'disabled'}`);
     const evaluateWithRetry = async (fn, arg, retries = 3) => {
         for (let attempt = 0; attempt < retries; attempt++) {
@@ -190,16 +212,54 @@ async function processCourse(page, courseChoice, config) {
                 const destroyed = /Execution context was destroyed|Cannot find context with specified id/i.test(message);
                 if (!destroyed || attempt === retries - 1)
                     throw err;
-                console.log("[Injector] Page refreshed itself; retrying evaluation...");
+                console.log("[Patcher] Page refreshed itself; retrying evaluation...");
                 await new Promise(resolve => setTimeout(resolve, 1000));
                 await page.waitForFunction(() => document.readyState === 'complete', { timeout: 10000 }).catch(() => { });
             }
         }
         throw new Error('Evaluation retries exceeded');
     };
-    const { downloadUrls = [], serializedHtml = '' } = await evaluateWithRetry((cfg) => {
-        const yearExp = cfg.applyYearRewrite ? new RegExp(cfg.yearExpSource, 'i') : null;
+    const { downloadUrls = [], serializedHtml = '' } = await evaluateWithRetry((config) => {
+        const yearExp = config.applyYearRewrite ? new RegExp(config.yearExpSource, 'i') : null;
         const urls = [];
+        const replacements = Object.entries(config.stringMap ?? {});
+        if (replacements.length) {
+            let replacedCount = 0;
+            const applyReplacements = (text) => {
+                if (!text)
+                    return '';
+                let next = text;
+                for (const [bad, good] of replacements) {
+                    if (next.includes(bad)) {
+                        const updated = next.split(bad).join(good);
+                        if (updated !== next) {
+                            replacedCount += 1;
+                            next = updated;
+                        }
+                    }
+                }
+                return next;
+            };
+            const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+            const textNodes = [];
+            while (walker.nextNode())
+                textNodes.push(walker.currentNode);
+            textNodes.forEach(node => {
+                node.nodeValue = applyReplacements(node.nodeValue);
+            });
+            document.querySelectorAll('[href]').forEach(el => {
+                const value = el.getAttribute('href');
+                const next = applyReplacements(value);
+                if (next !== value) {
+                    el.setAttribute('href', next);
+                    console.log(`[Patcher] [REPLACE] {${value}} -> {${next}}`);
+                }
+            });
+            if (replacedCount > 0) {
+                console.log(`[Patcher] String map replacements applied (${replacedCount})`);
+            }
+        }
+        ;
         const baseDir = location.pathname.endsWith('/') ? location.pathname : location.pathname.replace(/[^/]+$/, '/');
         const splitSegments = (pathname) => pathname.replace(/^\/+|\/+$/g, '').split('/').filter(Boolean);
         const baseParts = splitSegments(baseDir);
@@ -221,12 +281,12 @@ async function processCourse(page, courseChoice, config) {
             catch {
                 return null;
             }
-            if (cfg.forceHostReplacement && target.hostname === cfg.hostNeedingFix) {
-                target.hostname = cfg.hostReplacement;
+            if (config.forceHostReplacement && target.hostname === config.hostNeedingFix) {
+                target.hostname = config.hostReplacement;
                 target.port = '';
             }
             if (yearExp) {
-                const newPath = target.pathname.replace(yearExp, (_match, p1, p2) => `${p1}${cfg.yearPrefix}${cfg.courseYearDigits}${p2}`);
+                const newPath = target.pathname.replace(yearExp, (_match, p1, p2) => `${p1}${config.yearPrefix}${config.courseYearDigits}${p2}`);
                 target.pathname = newPath;
             }
             return target;
@@ -235,16 +295,17 @@ async function processCourse(page, courseChoice, config) {
             const a = li.querySelector('a');
             if (!a)
                 return;
-            if (a.href.includes('javascript:')) {
-                console.log(`[Injector] SKIP JS Link: ${a.href}`);
+            if (a.href.includes('javascript:'))
                 return;
-            }
             const fixed = normalizeUrl(a.href);
             if (!fixed)
                 return;
-            const finalHref = fixed.toString();
+            let finalHref = fixed.toString();
+            if (config.replaceCourseBuilderPaths) {
+                finalHref = finalHref.replace(/course_builder/g, 'courses');
+            }
             urls.push(finalHref);
-            console.log(`[Injector] URL added: ${finalHref}`);
+            console.log(`[Patcher] ADD ${finalHref}`);
         });
         document.querySelectorAll('a[href]').forEach(a => {
             const rawHref = a.getAttribute('href');
@@ -253,7 +314,7 @@ async function processCourse(page, courseChoice, config) {
             const fixed = normalizeUrl(rawHref);
             if (!fixed)
                 return;
-            if (fixed.href.startsWith(cfg.staffPrefix))
+            if (fixed.href.startsWith(config.staffPrefix))
                 return;
             if (fixed.origin === location.origin && fixed.pathname.startsWith('/course_builder/')) {
                 const relPath = toRelative(fixed.pathname);
@@ -274,7 +335,9 @@ async function processCourse(page, courseChoice, config) {
             const u = new URL(url);
             if (!ALLOWED_HOSTS.has(u.hostname))
                 return false;
-            if (!u.pathname.startsWith('/course_builder/'))
+            const pathOk = u.pathname.startsWith('/course_builder/') ||
+                u.pathname.startsWith('/courses/');
+            if (!pathOk)
                 return false;
             return true;
         }
@@ -332,6 +395,11 @@ async function processCourse(page, courseChoice, config) {
         args: ['--ignore-certificate-errors']
     });
     const page = await browser.newPage();
+    page.on('console', msg => {
+        const text = msg.text();
+        if (text.includes('Patcher'))
+            console.log(text);
+    });
     await page.goto(PMA_CBROOT, { waitUntil: ['domcontentloaded', 'networkidle0'] });
     const yearDirs = await page.$$eval('body > table > tbody > tr > td:nth-child(2) > a', anchors => anchors
         .map(a => ({
@@ -392,7 +460,7 @@ async function processCourse(page, courseChoice, config) {
         clearProgressLine();
         return;
     }
-    const { courses: selectedCourses, allSelected } = await chooseCourses(courseChoices);
+    const { courses: selectedCourses, allSelected, blockedOnly } = await chooseCourses(courseChoices);
     const courseYear = yearDigits(normalizedYear);
     const missingLog = allSelected ? [] : null;
     const totalCourses = selectedCourses.length;
@@ -401,7 +469,7 @@ async function processCourse(page, courseChoice, config) {
         renderProgress(completedCourses, totalCourses, courseProgress);
     };
     for (const course of selectedCourses) {
-        const injectionConfig = {
+        const patchConfig = {
             applyYearRewrite: !skipYearRewrite,
             yearExpSource: YEAR_FIX_REGEX_SOURCE,
             yearPrefix: hasUnderscore ? '_' : '',
@@ -410,10 +478,13 @@ async function processCourse(page, courseChoice, config) {
             forceHostReplacement,
             hostNeedingFix: PMA_IP,
             hostReplacement: PMA_NAME,
+            replaceCourseBuilderPaths: false,
+            blockedCoursesOnly: blockedOnly,
+            stringMap: STRING_MAP,
             missingLogger: missingLog ? (msg) => missingLog.push(msg) : undefined,
             courseProgressCb: updateProgress
         };
-        await processCourse(page, course, injectionConfig);
+        await processCourse(page, course, patchConfig);
         completedCourses += 1;
         updateProgress(null); // clear per-course line, show only overall
     }
