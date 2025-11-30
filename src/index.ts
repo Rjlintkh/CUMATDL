@@ -359,6 +359,8 @@ async function processCourse(page: Page, courseChoice: CourseChoice, config: Pat
           target.port = '';
         }
 
+        target.hostname = target.hostname.replace(/\.+$/, '');
+
         if (yearExp) {
           const newPath = target.pathname.replace(
             yearExp,
