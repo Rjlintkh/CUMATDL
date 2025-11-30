@@ -285,6 +285,7 @@ async function processCourse(page, courseChoice, config) {
                 target.hostname = config.hostReplacement;
                 target.port = '';
             }
+            target.hostname = target.hostname.replace(/\.+$/, '');
             if (yearExp) {
                 const newPath = target.pathname.replace(yearExp, (_match, p1, p2) => `${p1}${config.yearPrefix}${config.courseYearDigits}${p2}`);
                 target.pathname = newPath;
